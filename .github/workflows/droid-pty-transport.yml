@@ -1,0 +1,35 @@
+name: Droid PTY Transport
+
+on:
+  push:
+    branches:
+      - droid-pty-terminal-wire
+    paths:
+      - ".github/workflows/droid-pty-transport.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/alleycat/**"
+      - "crates/droid-bridge/**"
+  pull_request:
+    paths:
+      - ".github/workflows/droid-pty-transport.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/alleycat/**"
+      - "crates/droid-bridge/**"
+
+jobs:
+  droid-pty-transport:
+    name: fake Droid PTY transport tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run fake Droid PTY transport tests
+        run: cargo test -p alleycat-droid-bridge --locked
