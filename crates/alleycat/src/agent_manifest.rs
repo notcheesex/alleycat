@@ -277,3 +277,30 @@ pub const MANIFESTS: &[AgentManifest] = &[
 pub fn manifest_for(name: &str) -> Option<&'static AgentManifest> {
     MANIFESTS.iter().find(|m| m.name == name)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn droid_json_native_and_pty_capabilities_stay_separate() {
+        let droid = manifest_for("droid").expect("droid manifest");
+        assert_eq!(&droid.wire, &AgentWire::Jsonl);
+        assert!(
+            droid.terminal.is_none(),
+            "JSON/native Droid must not advertise terminal transport"
+        );
+
+        let droid_pty = manifest_for("droid-pty").expect("droid PTY manifest");
+        assert_eq!(&droid_pty.wire, &AgentWire::Terminal);
+        let terminal = droid_pty.terminal.expect("Droid PTY terminal metadata");
+        assert_eq!(terminal.transport, AgentTerminalTransport::DroidPty);
+        assert_eq!(terminal.launch_agent, Some("droid-pty"));
+        assert!(
+            terminal.features.contains(&"input")
+                && terminal.features.contains(&"resize")
+                && terminal.features.contains(&"close"),
+            "Droid PTY terminal metadata must carry terminal-only features"
+        );
+    }
+}
