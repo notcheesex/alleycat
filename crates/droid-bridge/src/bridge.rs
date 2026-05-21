@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 use crate::index::{self, DroidHydrator, DroidSessionRef, IndexEntry, ListFilter, ListSort};
 use crate::process::{DroidProcess, DroidSpawnConfig};
+use crate::terminal::serve_droid_terminal_stream;
 use crate::translate::{CompletedTurn, DroidTurnTranslator};
 
 const DEFAULT_DROID_BIN: &str = "droid";
@@ -64,6 +65,13 @@ pub struct DroidBridgeBuilder {
 impl DroidBridge {
     pub fn builder() -> DroidBridgeBuilder {
         DroidBridgeBuilder::default()
+    }
+
+    pub async fn serve_terminal_stream<S>(&self, stream: S) -> anyhow::Result<()>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        serve_droid_terminal_stream(self.droid_bin.clone(), stream).await
     }
 }
 

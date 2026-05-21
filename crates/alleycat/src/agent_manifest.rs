@@ -7,7 +7,10 @@
 //! catalogs keyed by the agent `name` and render a generic monogram
 //! fallback when no local asset is bundled.
 
-use crate::protocol::{AgentCapabilities, AgentPresentation, AgentWire};
+use crate::protocol::{
+    AgentCapabilities, AgentPresentation, AgentTerminalCapability, AgentTerminalTransport,
+    AgentWire,
+};
 
 /// Compile-time form. Owns no heap allocations so it can sit in a
 /// `const` slice. Runtime conversion to the wire types happens in
@@ -27,6 +30,16 @@ pub struct AgentManifest {
     pub uses_direct_codex_port: bool,
     pub supports_thread_permission_overrides: bool,
     pub reports_effective_thread_permissions: bool,
+    pub terminal: Option<AgentTerminalManifest>,
+}
+
+#[derive(Clone, Copy)]
+pub struct AgentTerminalManifest {
+    pub transport: AgentTerminalTransport,
+    pub protocol_version: u32,
+    pub features: &'static [&'static str],
+    pub launch_agent: Option<&'static str>,
+    pub label: Option<&'static str>,
 }
 
 impl AgentManifest {
@@ -50,6 +63,17 @@ impl AgentManifest {
             uses_direct_codex_port: self.uses_direct_codex_port,
             supports_thread_permission_overrides: self.supports_thread_permission_overrides,
             reports_effective_thread_permissions: self.reports_effective_thread_permissions,
+            terminal: self.terminal.map(|terminal| AgentTerminalCapability {
+                transport: terminal.transport,
+                protocol_version: terminal.protocol_version,
+                features: terminal
+                    .features
+                    .iter()
+                    .map(|feature| (*feature).to_owned())
+                    .collect(),
+                launch_agent: terminal.launch_agent.map(str::to_owned),
+                label: terminal.label.map(str::to_owned),
+            }),
         }
     }
 }
@@ -70,6 +94,7 @@ pub const MANIFESTS: &[AgentManifest] = &[
         uses_direct_codex_port: true,
         supports_thread_permission_overrides: true,
         reports_effective_thread_permissions: true,
+        terminal: None,
     },
     AgentManifest {
         name: "pi",
@@ -86,6 +111,7 @@ pub const MANIFESTS: &[AgentManifest] = &[
         uses_direct_codex_port: false,
         supports_thread_permission_overrides: false,
         reports_effective_thread_permissions: false,
+        terminal: None,
     },
     AgentManifest {
         name: "amp",
@@ -102,6 +128,7 @@ pub const MANIFESTS: &[AgentManifest] = &[
         uses_direct_codex_port: false,
         supports_thread_permission_overrides: false,
         reports_effective_thread_permissions: false,
+        terminal: None,
     },
     AgentManifest {
         name: "opencode",
@@ -118,6 +145,7 @@ pub const MANIFESTS: &[AgentManifest] = &[
         uses_direct_codex_port: false,
         supports_thread_permission_overrides: false,
         reports_effective_thread_permissions: false,
+        terminal: None,
     },
     AgentManifest {
         name: "claude",
@@ -134,6 +162,7 @@ pub const MANIFESTS: &[AgentManifest] = &[
         uses_direct_codex_port: false,
         supports_thread_permission_overrides: false,
         reports_effective_thread_permissions: false,
+        terminal: None,
     },
     AgentManifest {
         name: "droid",
@@ -150,6 +179,30 @@ pub const MANIFESTS: &[AgentManifest] = &[
         uses_direct_codex_port: false,
         supports_thread_permission_overrides: false,
         reports_effective_thread_permissions: false,
+        terminal: None,
+    },
+    AgentManifest {
+        name: "droid-pty",
+        display_name: "Droid TUI",
+        wire: AgentWire::Terminal,
+        title: Some("Factory Droid TUI"),
+        is_beta: true,
+        sort_order: 6,
+        description: Some("Factory Droid interactive PTY/TUI terminal."),
+        aliases: &["droid-terminal", "droid_tui", "factory-droid-pty", "factory droid tui"],
+        locks_reasoning_effort_after_activity: false,
+        visible_modes: Some(&["terminal"]),
+        supports_ssh_bridge: false,
+        uses_direct_codex_port: false,
+        supports_thread_permission_overrides: false,
+        reports_effective_thread_permissions: false,
+        terminal: Some(AgentTerminalManifest {
+            transport: AgentTerminalTransport::DroidPty,
+            protocol_version: 1,
+            features: &["hello", "start", "output", "input", "resize", "close", "exit", "error"],
+            launch_agent: Some("droid-pty"),
+            label: Some("Droid TUI"),
+        }),
     },
     AgentManifest {
         name: "hermes",
@@ -157,7 +210,7 @@ pub const MANIFESTS: &[AgentManifest] = &[
         wire: AgentWire::Jsonl,
         title: Some("Hermes"),
         is_beta: true,
-        sort_order: 6,
+        sort_order: 7,
         description: Some("Nous Research Hermes agent."),
         aliases: &[],
         locks_reasoning_effort_after_activity: false,
@@ -166,6 +219,7 @@ pub const MANIFESTS: &[AgentManifest] = &[
         uses_direct_codex_port: false,
         supports_thread_permission_overrides: false,
         reports_effective_thread_permissions: false,
+        terminal: None,
     },
     AgentManifest {
         name: "devin",
@@ -173,7 +227,7 @@ pub const MANIFESTS: &[AgentManifest] = &[
         wire: AgentWire::Jsonl,
         title: Some("Devin"),
         is_beta: true,
-        sort_order: 7,
+        sort_order: 8,
         description: Some("Devin coding agent."),
         aliases: &[],
         locks_reasoning_effort_after_activity: false,
@@ -182,6 +236,7 @@ pub const MANIFESTS: &[AgentManifest] = &[
         uses_direct_codex_port: false,
         supports_thread_permission_overrides: false,
         reports_effective_thread_permissions: false,
+        terminal: None,
     },
     AgentManifest {
         name: "grok",
@@ -189,7 +244,7 @@ pub const MANIFESTS: &[AgentManifest] = &[
         wire: AgentWire::Jsonl,
         title: Some("Grok"),
         is_beta: true,
-        sort_order: 8,
+        sort_order: 9,
         description: Some("xAI Grok coding agent."),
         aliases: &["grok-code", "xai-grok", "xai grok"],
         locks_reasoning_effort_after_activity: false,
@@ -198,6 +253,7 @@ pub const MANIFESTS: &[AgentManifest] = &[
         uses_direct_codex_port: false,
         supports_thread_permission_overrides: false,
         reports_effective_thread_permissions: false,
+        terminal: None,
     },
     AgentManifest {
         name: "shell",
@@ -205,7 +261,7 @@ pub const MANIFESTS: &[AgentManifest] = &[
         wire: AgentWire::Jsonl,
         title: Some("Shell"),
         is_beta: true,
-        sort_order: 9,
+        sort_order: 10,
         description: Some("PTY-backed host shell."),
         aliases: &["terminal"],
         locks_reasoning_effort_after_activity: false,
@@ -214,6 +270,7 @@ pub const MANIFESTS: &[AgentManifest] = &[
         uses_direct_codex_port: false,
         supports_thread_permission_overrides: false,
         reports_effective_thread_permissions: false,
+        terminal: None,
     },
 ];
 

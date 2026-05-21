@@ -43,6 +43,7 @@ pub enum AgentKind {
     Claude,
     Opencode,
     Droid,
+    DroidPty,
     Hermes,
     Devin,
     Grok,
@@ -130,6 +131,7 @@ pub struct AgentManager {
     /// Whether the selected codex executable could be spawned.
     codex_available: bool,
     session_registry: Arc<SessionRegistry>,
+    droid_bridge: Arc<DroidBridge>,
     /// Held to keep the registry's reaper alive for the daemon lifetime.
     _reaper_handle: Arc<tokio::task::JoinHandle<()>>,
 }
@@ -235,7 +237,7 @@ impl AgentManager {
         bridges.insert(AgentKind::Pi, pi_bridge as Arc<dyn Bridge>);
         bridges.insert(AgentKind::Amp, amp_bridge as Arc<dyn Bridge>);
         bridges.insert(AgentKind::Claude, claude_bridge as Arc<dyn Bridge>);
-        bridges.insert(AgentKind::Droid, droid_bridge as Arc<dyn Bridge>);
+        bridges.insert(AgentKind::Droid, droid_bridge.clone() as Arc<dyn Bridge>);
         bridges.insert(AgentKind::Devin, devin_bridge);
         bridges.insert(AgentKind::Grok, grok_bridge);
         bridges.insert(AgentKind::Shell, shell_bridge);
@@ -293,6 +295,7 @@ impl AgentManager {
             codex_bin: codex_detection.bin,
             codex_available: codex_detection.available,
             session_registry,
+            droid_bridge,
             _reaper_handle: reaper_handle,
         })
     }
@@ -331,6 +334,7 @@ impl AgentManager {
                 "opencode" => self.opencode_available(),
                 "claude" => self.claude_available(),
                 "droid" => self.droid_available(),
+                "droid-pty" => self.droid_available(),
                 "hermes" => self.hermes_available().await,
                 "devin" => self.devin_available(),
                 "grok" => self.grok_available(),
@@ -386,6 +390,13 @@ impl AgentManager {
                 let _ = (session, last_seen);
                 self.serve_codex(stream).await
             }
+            "droid-pty" | "droid-terminal" | "droid_tui" => {
+                let _ = (session, last_seen);
+                self.droid_bridge
+                    .serve_terminal_stream(stream)
+                    .await
+                    .context("serving `droid-pty` terminal stream")
+            }
             other => {
                 let kind =
                     agent_kind_from_str(other).ok_or_else(|| anyhow!("unknown agent `{other}`"))?;
@@ -435,6 +446,7 @@ impl AgentManager {
             "opencode" => Some("opencode"),
             "claude" => Some("claude"),
             "droid" => Some("droid"),
+            "droid-pty" | "droid-terminal" | "droid_tui" => Some("droid-pty"),
             "hermes" => Some("hermes"),
             "devin" => Some("devin"),
             "grok" => Some("grok"),
@@ -452,6 +464,7 @@ impl AgentManager {
             "opencode" => cfg.agents.opencode.enabled,
             "claude" => cfg.agents.claude.enabled,
             "droid" => cfg.agents.droid.enabled,
+            "droid-pty" | "droid-terminal" | "droid_tui" => cfg.agents.droid.enabled,
             "hermes" => cfg.agents.hermes.enabled,
             "devin" => cfg.agents.devin.enabled,
             "grok" => cfg.agents.grok.enabled,
@@ -1302,6 +1315,7 @@ fn agent_kind_from_str(name: &str) -> Option<AgentKind> {
         "claude" => Some(AgentKind::Claude),
         "opencode" => Some(AgentKind::Opencode),
         "droid" => Some(AgentKind::Droid),
+        "droid-pty" | "droid-terminal" | "droid_tui" => Some(AgentKind::DroidPty),
         "hermes" => Some(AgentKind::Hermes),
         "devin" => Some(AgentKind::Devin),
         "grok" => Some(AgentKind::Grok),
@@ -1317,6 +1331,7 @@ fn agent_kind_str(kind: AgentKind) -> &'static str {
         AgentKind::Claude => "claude",
         AgentKind::Opencode => "opencode",
         AgentKind::Droid => "droid",
+        AgentKind::DroidPty => "droid-pty",
         AgentKind::Hermes => "hermes",
         AgentKind::Devin => "devin",
         AgentKind::Grok => "grok",
@@ -1332,6 +1347,7 @@ impl crate::config::AgentsConfig {
             AgentKind::Claude => self.claude.enabled,
             AgentKind::Opencode => self.opencode.enabled,
             AgentKind::Droid => self.droid.enabled,
+            AgentKind::DroidPty => self.droid.enabled,
             AgentKind::Hermes => self.hermes.enabled,
             AgentKind::Devin => self.devin.enabled,
             AgentKind::Grok => self.grok.enabled,

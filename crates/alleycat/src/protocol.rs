@@ -19,6 +19,7 @@ pub struct PairPayload {
 pub enum AgentWire {
     Websocket,
     Jsonl,
+    Terminal,
 }
 
 impl AgentWire {
@@ -26,6 +27,7 @@ impl AgentWire {
         match self {
             Self::Websocket => "websocket",
             Self::Jsonl => "jsonl",
+            Self::Terminal => "terminal",
         }
     }
 }
@@ -97,6 +99,30 @@ pub struct AgentCapabilities {
     /// hydrate or imply permissions from missing/placeholder values.
     #[serde(default)]
     pub reports_effective_thread_permissions: bool,
+    /// Terminal transport metadata for PTY/TUI agents. Kept out of `wire`
+    /// alone so clients can reject ambiguous/legacy peers before creating a
+    /// terminal session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<AgentTerminalCapability>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentTerminalCapability {
+    pub transport: AgentTerminalTransport,
+    pub protocol_version: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentTerminalTransport {
+    DroidPty,
+    TerminalPty,
 }
 
 /// Resume hint sent on `Connect` when a reconnecting client wants to
