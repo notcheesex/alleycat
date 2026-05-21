@@ -1,7 +1,8 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use alleycat_acp_bridge::AcpBridge;
@@ -132,8 +133,58 @@ pub struct AgentManager {
     codex_available: bool,
     session_registry: Arc<SessionRegistry>,
     droid_bridge: Arc<DroidBridge>,
+    terminal_sessions: TerminalSessionReservations,
     /// Held to keep the registry's reaper alive for the daemon lifetime.
     _reaper_handle: Arc<tokio::task::JoinHandle<()>>,
+}
+
+#[derive(Clone, Default, Debug)]
+struct TerminalSessionReservations {
+    active: Arc<StdMutex<HashSet<(String, &'static str)>>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct TerminalSessionReservation {
+    active: Arc<StdMutex<HashSet<(String, &'static str)>>>,
+    key: (String, &'static str),
+}
+
+impl TerminalSessionReservations {
+    fn reserve(
+        &self,
+        session: &Session,
+        last_seen: Option<u64>,
+    ) -> anyhow::Result<TerminalSessionReservation> {
+        if last_seen.is_some() {
+            anyhow::bail!(
+                "Droid PTY terminal sessions cannot be resumed; previous terminal session ended or detached"
+            );
+        }
+        let key = (session.node_id.clone(), session.agent);
+        let mut active = self
+            .active
+            .lock()
+            .expect("terminal session reservation mutex poisoned");
+        if !active.insert(key.clone()) {
+            anyhow::bail!(
+                "Droid PTY terminal session is already active for this client; refusing duplicate live PTY session"
+            );
+        }
+        Ok(TerminalSessionReservation {
+            active: Arc::clone(&self.active),
+            key,
+        })
+    }
+}
+
+impl Drop for TerminalSessionReservation {
+    fn drop(&mut self) {
+        let mut active = self
+            .active
+            .lock()
+            .expect("terminal session reservation mutex poisoned");
+        active.remove(&self.key);
+    }
 }
 
 impl AgentManager {
@@ -296,12 +347,21 @@ impl AgentManager {
             codex_available: codex_detection.available,
             session_registry,
             droid_bridge,
+            terminal_sessions: TerminalSessionReservations::default(),
             _reaper_handle: reaper_handle,
         })
     }
 
     pub fn session_registry(&self) -> &Arc<SessionRegistry> {
         &self.session_registry
+    }
+
+    pub(crate) fn reserve_terminal_session(
+        &self,
+        session: &Session,
+        last_seen: Option<u64>,
+    ) -> anyhow::Result<TerminalSessionReservation> {
+        self.terminal_sessions.reserve(session, last_seen)
     }
 
     /// Fan out a shutdown call to every registered bridge. Called from
@@ -373,12 +433,13 @@ impl AgentManager {
 
     /// Session-aware dispatch: the iroh stream attaches to the supplied
     /// session and survives a client disconnect.
-    pub async fn serve_agent_with_session(
+    pub(crate) async fn serve_agent_with_session(
         &self,
         agent: &str,
         stream: IrohStream,
         session: Arc<Session>,
         last_seen: Option<u64>,
+        terminal_reservation: Option<TerminalSessionReservation>,
     ) -> anyhow::Result<()> {
         match agent {
             // Codex doesn't participate in the JSON-RPC replay scheme —
@@ -391,11 +452,19 @@ impl AgentManager {
                 self.serve_codex(stream).await
             }
             "droid-pty" | "droid-terminal" | "droid_tui" => {
-                let _ = (session, last_seen);
-                self.droid_bridge
+                let reservation = match terminal_reservation {
+                    Some(reservation) => reservation,
+                    None => self.terminal_sessions.reserve(&session, last_seen)?,
+                };
+                let result = self
+                    .droid_bridge
                     .serve_terminal_stream(stream)
                     .await
-                    .context("serving `droid-pty` terminal stream")
+                    .context("serving `droid-pty` terminal stream");
+                self.session_registry
+                    .release(&session.node_id, session.agent);
+                drop(reservation);
+                result
             }
             other => {
                 let kind =
@@ -1393,5 +1462,30 @@ mod tests {
         assert!(codex_needs_windows_cmd_shell(Path::new("CODEX.BAT")));
         assert!(!codex_needs_windows_cmd_shell(Path::new("codex.exe")));
         assert!(!codex_needs_windows_cmd_shell(Path::new("pi.cmd")));
+    }
+
+    #[test]
+    fn droid_pty_terminal_reservations_reject_resume_and_duplicates() {
+        let reservations = TerminalSessionReservations::default();
+        let session = Session::new("droid-pty", "node-a".to_string(), 16, 4096);
+
+        let first = reservations
+            .reserve(&session, None)
+            .expect("first terminal reservation should succeed");
+        let duplicate = reservations
+            .reserve(&session, None)
+            .expect_err("duplicate live PTY reservation must fail");
+        assert!(duplicate.to_string().contains("duplicate live PTY session"));
+
+        drop(first);
+        let second = reservations
+            .reserve(&session, None)
+            .expect("terminal may be started again after prior cleanup");
+        drop(second);
+
+        let resume = reservations
+            .reserve(&session, Some(0))
+            .expect_err("Droid PTY resume must report ended/detached policy");
+        assert!(resume.to_string().contains("ended or detached"));
     }
 }

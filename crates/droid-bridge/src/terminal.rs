@@ -1,6 +1,10 @@
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::Duration;
 
 use anyhow::{Context, anyhow};
 use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -12,6 +16,7 @@ use tracing::{debug, warn};
 pub const TERMINAL_PROTOCOL_VERSION: u16 = 1;
 const MAGIC: &[u8; 4] = b"DPTY";
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
+const SHUTDOWN_GRACE: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -199,78 +204,132 @@ where
         cols: start.cols,
         rows: start.rows,
     };
-    validate_size(size)?;
-    let spawned = tokio::task::spawn_blocking(move || {
+    if let Err(error) = validate_size(size) {
+        write_error(&mut writer, "invalid_size", &error.to_string()).await?;
+        return Err(error);
+    }
+    let spawned = match tokio::task::spawn_blocking(move || {
         DroidTerminalSession::spawn("droid-pty".to_string(), droid_bin, start.cwd, size)
     })
     .await
-    .context("joining droid PTY spawn task")??;
+    {
+        Ok(Ok(spawned)) => spawned,
+        Ok(Err(error)) => {
+            let message = format!("Droid PTY failed to start: {error:#}");
+            write_error(&mut writer, "spawn_failed", &message).await?;
+            return Err(error);
+        }
+        Err(error) => {
+            write_error(&mut writer, "spawn_failed", "Droid PTY spawn task failed").await?;
+            return Err(anyhow!(error).context("joining droid PTY spawn task"));
+        }
+    };
 
     let session = spawned.session;
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     spawn_output_thread(spawned.reader, event_tx.clone());
     spawn_wait_thread(spawned.child, event_tx);
 
-    loop {
-        tokio::select! {
-            frame = read_frame(&mut reader) => {
-                let frame = match frame {
-                    Ok(frame) => frame,
-                    Err(error) => {
-                        debug!(error = %error, "droid PTY client stream ended");
-                        let _ = session.kill();
-                        return Ok(());
-                    }
-                };
-                match frame.kind {
-                    TerminalFrameKind::Input => {
-                        let byte_count = frame.payload.len();
-                        let session = Arc::clone(&session);
-                        tokio::task::spawn_blocking(move || session.write(&frame.payload))
-                            .await
-                            .context("joining droid PTY input task")??;
-                        debug!(byte_count, "forwarded droid PTY input");
-                    }
-                    TerminalFrameKind::Resize => {
-                        let size = decode_resize_payload(&frame.payload)?;
-                        validate_size(size)?;
-                        let session = Arc::clone(&session);
-                        tokio::task::spawn_blocking(move || session.resize(size))
-                            .await
-                            .context("joining droid PTY resize task")??;
-                    }
-                    TerminalFrameKind::Close => {
-                        let _ = session.kill();
-                        break;
-                    }
-                    _ => {
-                        write_error(&mut writer, "unexpected_frame", "unexpected client terminal frame").await?;
+    let result: anyhow::Result<()> = async {
+        let mut close_requested = false;
+        let mut output_closed = false;
+        let mut pending_exit = None;
+        'terminal: loop {
+            tokio::select! {
+                frame = read_frame(&mut reader), if !close_requested => {
+                    let frame = match frame {
+                        Ok(frame) => frame,
+                        Err(error) => {
+                            debug!(error = %error, "droid PTY client stream ended");
+                            shutdown_session(Arc::clone(&session), "client_disconnect").await?;
+                            break 'terminal Ok(());
+                        }
+                    };
+                    match frame.kind {
+                        TerminalFrameKind::Input => {
+                            if close_requested {
+                                debug!("ignoring Droid PTY input after close");
+                                continue;
+                            }
+                            let byte_count = frame.payload.len();
+                            let session = Arc::clone(&session);
+                            tokio::task::spawn_blocking(move || session.write(&frame.payload))
+                                .await
+                                .context("joining droid PTY input task")??;
+                            debug!(byte_count, "forwarded droid PTY input");
+                        }
+                        TerminalFrameKind::Resize => {
+                            if close_requested {
+                                debug!("ignoring Droid PTY resize after close");
+                                continue;
+                            }
+                            let size = decode_resize_payload(&frame.payload)?;
+                            validate_size(size)?;
+                            let session = Arc::clone(&session);
+                            tokio::task::spawn_blocking(move || session.resize(size))
+                                .await
+                                .context("joining droid PTY resize task")??;
+                        }
+                        TerminalFrameKind::Close => {
+                            close_requested = true;
+                            shutdown_session(Arc::clone(&session), "client_close").await?;
+                        }
+                        _ => {
+                            write_error(&mut writer, "unexpected_frame", "unexpected client terminal frame").await?;
+                        }
                     }
                 }
-            }
-            event = event_rx.recv() => {
-                match event {
-                    Some(TerminalEvent::Output(bytes)) => {
-                        let byte_count = bytes.len();
-                        write_frame(&mut writer, &TerminalFrame {
-                            kind: TerminalFrameKind::Output,
-                            payload: bytes,
-                        }).await?;
-                        debug!(byte_count, "sent droid PTY output");
+                event = event_rx.recv() => {
+                    match event {
+                        Some(TerminalEvent::Output(bytes)) => {
+                            let byte_count = bytes.len();
+                            write_frame(&mut writer, &TerminalFrame {
+                                kind: TerminalFrameKind::Output,
+                                payload: bytes,
+                            }).await?;
+                            debug!(byte_count, "sent droid PTY output");
+                        }
+                        Some(TerminalEvent::OutputClosed) => {
+                            output_closed = true;
+                            if let Some(code) = pending_exit {
+                                write_frame(&mut writer, &TerminalFrame {
+                                    kind: TerminalFrameKind::Exit,
+                                    payload: exit_payload(code).to_vec(),
+                                }).await?;
+                                break 'terminal Ok(());
+                            }
+                        }
+                        Some(TerminalEvent::Exit(code)) => {
+                            pending_exit = Some(code);
+                            if output_closed {
+                                write_frame(&mut writer, &TerminalFrame {
+                                    kind: TerminalFrameKind::Exit,
+                                    payload: exit_payload(code).to_vec(),
+                                }).await?;
+                                break 'terminal Ok(());
+                            }
+                        }
+                        None => {
+                            if let Some(code) = pending_exit {
+                                write_frame(&mut writer, &TerminalFrame {
+                                    kind: TerminalFrameKind::Exit,
+                                    payload: exit_payload(code).to_vec(),
+                                }).await?;
+                            }
+                            break 'terminal Ok(());
+                        }
                     }
-                    Some(TerminalEvent::Exit(code)) => {
-                        write_frame(&mut writer, &TerminalFrame {
-                            kind: TerminalFrameKind::Exit,
-                            payload: exit_payload(code).to_vec(),
-                        }).await?;
-                        break;
-                    }
-                    None => break,
                 }
             }
         }
     }
-    Ok(())
+    .await;
+    if result.is_err() {
+        if let Err(error) = shutdown_session(Arc::clone(&session), "stream_error").await {
+            warn!(%error, "failed to clean up Droid PTY after stream error");
+        }
+    }
+    result
 }
 
 async fn negotiate_terminal<R, W>(reader: &mut R, writer: &mut W) -> anyhow::Result<()>
@@ -299,8 +358,12 @@ where
     if client.min_version > TERMINAL_PROTOCOL_VERSION
         || client.max_version < TERMINAL_PROTOCOL_VERSION
     {
-        write_error(writer, "unsupported_version", "terminal protocol version is unsupported")
-            .await?;
+        write_error(
+            writer,
+            "unsupported_version",
+            "terminal protocol version is unsupported",
+        )
+        .await?;
         return Err(anyhow!("unsupported terminal protocol version"));
     }
     let server = HelloPayload {
@@ -320,10 +383,12 @@ where
 }
 
 fn terminal_features() -> Vec<String> {
-    ["hello", "start", "output", "input", "resize", "close", "exit", "error"]
-        .iter()
-        .map(|feature| (*feature).to_owned())
-        .collect()
+    [
+        "hello", "start", "output", "input", "resize", "close", "exit", "error",
+    ]
+    .iter()
+    .map(|feature| (*feature).to_owned())
+    .collect()
 }
 
 async fn write_error<W>(writer: &mut W, code: &str, message: &str) -> Result<(), TerminalWireError>
@@ -345,6 +410,7 @@ where
 
 enum TerminalEvent {
     Output(Vec<u8>),
+    OutputClosed,
     Exit(i32),
 }
 
@@ -353,6 +419,8 @@ struct DroidTerminalSession {
     writer: Mutex<Box<dyn Write + Send>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
+    process_group_leader: Option<i32>,
+    closed: AtomicBool,
 }
 
 struct SpawnedDroidTerminal {
@@ -394,18 +462,27 @@ impl DroidTerminalSession {
             .master
             .try_clone_reader()
             .context("cloning Droid PTY reader")?;
-        let writer = pair.master.take_writer().context("taking Droid PTY writer")?;
+        let writer = pair
+            .master
+            .take_writer()
+            .context("taking Droid PTY writer")?;
         let child = pair
             .slave
             .spawn_command(cmd)
             .with_context(|| format!("spawning interactive `{}`", droid_bin.display()))?;
         let killer = child.clone_killer();
+        let process_group_leader = pair
+            .master
+            .process_group_leader()
+            .map(|process_group| process_group as i32);
         Ok(SpawnedDroidTerminal {
             session: Arc::new(Self {
                 id,
                 writer: Mutex::new(writer),
                 master: Mutex::new(pair.master),
                 killer: Mutex::new(killer),
+                process_group_leader,
+                closed: AtomicBool::new(false),
             }),
             reader,
             child,
@@ -431,17 +508,95 @@ impl DroidTerminalSession {
             .context("resizing Droid PTY")
     }
 
-    fn kill(&self) -> anyhow::Result<()> {
+    fn shutdown(&self, reason: &str) -> anyhow::Result<()> {
+        if self.closed.swap(true, Ordering::SeqCst) {
+            debug!(
+                session = %self.id,
+                reason,
+                "Droid PTY shutdown already completed"
+            );
+            return Ok(());
+        }
+        debug!(session = %self.id, reason, "shutting down Droid PTY session");
+        #[cfg(unix)]
+        if let Some(pgid) = self.process_group_leader {
+            if let Err(error) = terminate_process_group(pgid, reason) {
+                warn!(
+                    session = %self.id,
+                    pgid,
+                    reason,
+                    %error,
+                    "Droid PTY process-group shutdown failed; falling back to child killer"
+                );
+            }
+        }
         let mut killer = self.killer.lock().expect("droid PTY killer mutex poisoned");
-        killer
-            .kill()
-            .with_context(|| format!("killing Droid PTY session {}", self.id))
+        if let Err(error) = killer.kill() {
+            debug!(
+                session = %self.id,
+                reason,
+                %error,
+                "Droid PTY child killer returned after shutdown"
+            );
+        }
+        Ok(())
+    }
+}
+
+async fn shutdown_session(
+    session: Arc<DroidTerminalSession>,
+    reason: &'static str,
+) -> anyhow::Result<()> {
+    tokio::task::spawn_blocking(move || session.shutdown(reason))
+        .await
+        .context("joining droid PTY shutdown task")?
+}
+
+#[cfg(unix)]
+fn terminate_process_group(pgid: i32, reason: &str) -> anyhow::Result<()> {
+    let pgid = pgid as libc::pid_t;
+    if pgid <= 1 {
+        return Ok(());
+    }
+    signal_process_group(pgid, libc::SIGTERM)
+        .with_context(|| format!("sending SIGTERM to Droid PTY process group {pgid} ({reason})"))?;
+    std::thread::sleep(SHUTDOWN_GRACE);
+    if process_group_exists(pgid) {
+        signal_process_group(pgid, libc::SIGKILL).with_context(|| {
+            format!("sending SIGKILL to Droid PTY process group {pgid} after timeout ({reason})")
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn process_group_exists(pgid: libc::pid_t) -> bool {
+    if unsafe { libc::killpg(pgid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(unix)]
+fn signal_process_group(pgid: libc::pid_t, signal: libc::c_int) -> std::io::Result<()> {
+    if unsafe { libc::killpg(pgid, signal) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(error)
     }
 }
 
 fn validate_size(size: TerminalSize) -> anyhow::Result<()> {
     if size.cols == 0 || size.rows == 0 {
-        anyhow::bail!("terminal size must be non-zero, got {}x{}", size.cols, size.rows);
+        anyhow::bail!(
+            "terminal size must be non-zero, got {}x{}",
+            size.cols,
+            size.rows
+        );
     }
     Ok(())
 }
@@ -463,10 +618,14 @@ fn spawn_output_thread(mut reader: Box<dyn Read + Send>, tx: mpsc::UnboundedSend
                 }
             }
         }
+        let _ = tx.send(TerminalEvent::OutputClosed);
     });
 }
 
-fn spawn_wait_thread(mut child: Box<dyn Child + Send + Sync>, tx: mpsc::UnboundedSender<TerminalEvent>) {
+fn spawn_wait_thread(
+    mut child: Box<dyn Child + Send + Sync>,
+    tx: mpsc::UnboundedSender<TerminalEvent>,
+) {
     std::thread::spawn(move || {
         let code = match child.wait() {
             Ok(status) => status.exit_code() as i32,
@@ -519,10 +678,16 @@ mod tests {
 
     #[test]
     fn resize_payload_is_typed_and_binary() {
-        let payload = resize_payload(TerminalSize { cols: 132, rows: 43 });
+        let payload = resize_payload(TerminalSize {
+            cols: 132,
+            rows: 43,
+        });
         assert_eq!(
             decode_resize_payload(&payload).unwrap(),
-            TerminalSize { cols: 132, rows: 43 }
+            TerminalSize {
+                cols: 132,
+                rows: 43
+            }
         );
     }
 

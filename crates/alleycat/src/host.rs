@@ -188,6 +188,12 @@ async fn handle_stream(
                     return Err(anyhow!("unknown agent: {agent}"));
                 }
             };
+            if agent_static == "droid-pty" && resume.is_some() {
+                let message = "Droid PTY terminal sessions cannot be resumed; previous terminal session ended or detached";
+                write_json_frame(&mut send, &Response::error(message)).await?;
+                return Err(anyhow!(message));
+            }
+            let is_terminal_agent = agent_static == "droid-pty";
 
             let last_seen = resume.as_ref().map(|r: &Resume| r.last_seq);
             let resolved =
@@ -195,9 +201,33 @@ async fn handle_stream(
                     .session_registry()
                     .resolve_attach(node_id.clone(), agent_static, last_seen);
             let session_info = SessionInfo {
-                attached: resolved.kind.into(),
-                current_seq: resolved.current_seq,
-                floor_seq: resolved.floor_seq,
+                attached: if is_terminal_agent {
+                    alleycat_bridge_core::session::AttachKind::Fresh.into()
+                } else {
+                    resolved.kind.into()
+                },
+                current_seq: if is_terminal_agent {
+                    0
+                } else {
+                    resolved.current_seq
+                },
+                floor_seq: if is_terminal_agent {
+                    0
+                } else {
+                    resolved.floor_seq
+                },
+            };
+            let terminal_reservation = if is_terminal_agent {
+                match agents.reserve_terminal_session(&resolved.session, None) {
+                    Ok(reservation) => Some(reservation),
+                    Err(error) => {
+                        let message = error.to_string();
+                        write_json_frame(&mut send, &Response::error(message.clone())).await?;
+                        return Err(error);
+                    }
+                }
+            } else {
+                None
             };
             info!(
                 conn = conn,
@@ -213,9 +243,15 @@ async fn handle_stream(
             // `last_attempted_seq` for a known session attaching without one.
             // For Fresh and DriftReload paths it returned None, so the
             // dispatcher sees an empty backlog.
-            let dispatch_last_seen = match resolved.kind {
-                alleycat_bridge_core::session::AttachKind::Resumed => resolved.effective_last_seen,
-                _ => None,
+            let dispatch_last_seen = if is_terminal_agent {
+                None
+            } else {
+                match resolved.kind {
+                    alleycat_bridge_core::session::AttachKind::Resumed => {
+                        resolved.effective_last_seen
+                    }
+                    _ => None,
+                }
             };
             let result = agents
                 .serve_agent_with_session(
@@ -223,6 +259,7 @@ async fn handle_stream(
                     IrohStream::new(send, recv),
                     resolved.session,
                     dispatch_last_seen,
+                    terminal_reservation,
                 )
                 .await
                 .with_context(|| format!("serving agent `{agent}`"));

@@ -1,4 +1,5 @@
 use std::io::{self, BufRead, Read, Write};
+use std::process::{Command, Stdio};
 
 use serde_json::{Value, json};
 
@@ -59,6 +60,18 @@ fn main() {
 }
 
 fn interactive_tui() {
+    if matches!(
+        std::env::var("FAKE_DROID_MODE").as_deref(),
+        Ok("auth-failure")
+    ) {
+        let _ = writeln!(
+            io::stderr(),
+            "FAKE_DROID_AUTH_REQUIRED Factory auth unavailable; run droid login"
+        );
+        std::process::exit(42);
+    }
+    write_pid_file_from_env("FAKE_DROID_PID_FILE", std::process::id());
+    spawn_grandchild_from_env();
     enable_raw_stdin();
     let mut stdout = io::stdout();
     let _ = writeln!(
@@ -91,17 +104,46 @@ fn interactive_tui() {
         if chunk == b"\x04" || chunk == b"quit\n" {
             break;
         }
-        if chunk.windows(b"BURST\n".len()).any(|window| window == b"BURST\n") {
+        if chunk
+            .windows(b"BURST\n".len())
+            .any(|window| window == b"BURST\n")
+        {
             for _ in 0..512 {
                 let _ = stdout.write_all(b"0123456789abcdef0123456789abcdef\r\n");
             }
         }
-        if chunk.windows(b"SIZE?\n".len()).any(|window| window == b"SIZE?\n") {
+        if chunk
+            .windows(b"SIZE?\n".len())
+            .any(|window| window == b"SIZE?\n")
+        {
             let _ = writeln!(stdout, "SIZE:{}x{}", terminal_rows(), terminal_cols());
         }
         let _ = writeln!(stdout, "INPUT_HEX:{}", hex_bytes(chunk));
         let _ = stdout.flush();
     }
+}
+
+fn write_pid_file_from_env(key: &str, pid: u32) {
+    if let Ok(path) = std::env::var(key) {
+        let _ = std::fs::write(path, format!("{pid}\n"));
+    }
+}
+
+fn spawn_grandchild_from_env() {
+    let Ok(path) = std::env::var("FAKE_DROID_GRANDCHILD_PID_FILE") else {
+        return;
+    };
+    let _ = Command::new("sh")
+        .env("FAKE_DROID_GRANDCHILD_PID_FILE", path)
+        .arg("-c")
+        .arg(
+            "printf '%s\\n' \"$$\" > \"$FAKE_DROID_GRANDCHILD_PID_FILE\"; \
+             trap '' TERM; while :; do sleep 1; done",
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
